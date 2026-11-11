@@ -1,0 +1,13 @@
+[package]
+name = "aniwatch-rust"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+discord-rpc-client = "0.4.0"
+reqwest = { version = "0.13.5", features = ["blocking", "json"] }
+serde = {version = "1.0.229", features = ["derive"]}
+serde_json = "1.0.154"
+tar = "0.4.46"
+uuid = {version = "1.29.2", features = ["v4"]}
+zstd = "0.14.3"
