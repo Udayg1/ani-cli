@@ -1,14 +1,14 @@
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::{
-    env,
-    fmt::format,
-    fs,
+    env, fs,
     io::{BufRead, BufReader, Cursor, Write},
     os::unix::{fs::PermissionsExt, net::UnixStream},
     path::{Path, PathBuf},
-    process::{Child, ChildStderr, ChildStdin, Command, Stdio},
+    process::{Child, ChildStderr, ChildStdin, Command, Stdio, exit},
+    thread,
+    time::{Duration, Instant},
 };
-
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub struct Server {
@@ -119,8 +119,12 @@ impl Server {
 
         let socket_handle = UnixStream::connect(socket).expect("failure connecting to socket");
 
-        ensure_mpv(&output_dir);
-
+        let mpv = ensure_mpv(&output_dir);
+        if mpv.is_err() {
+            println!("Can't initialize mpv, {}", mpv.unwrap_err());
+            fs::remove_dir_all(output_dir).unwrap_or(());
+            exit(1);
+        }
         Server {
             _id: 1,
             _child: child,
@@ -175,25 +179,88 @@ impl Server {
         writeln!(self.socket_handle, "{}", request_json)
             .expect("cant write to socket for source request");
         let response = self.read_response();
-        println!("{response}");
         serde_json::from_str(&response).expect("cant convert response")
     }
 
-    pub fn play_episode(&mut self, source: Source) {
-        let mut mpv_args = Vec::new();
-        mpv_args.push(source.url);
-        if !source.sub.is_none() {
-            mpv_args.push(format!("--sub-file={}", source.sub.clone().unwrap()));
+    pub fn play_episode(&mut self, source: Source) -> std::io::Result<Playback> {
+        let sock = self.output_dir.join("mpv.sock"); // your per-run temp dir
+
+        let mut args = vec![
+            format!("--input-ipc-server={}", sock.display()),
+            "--no-terminal".to_string(),
+            format!("--referrer={}", source.headers.referer),
+        ];
+        if let Some(sub) = &source.sub {
+            args.push(format!("--sub-file={sub}"));
         }
-        mpv_args.push(format!("--referrer={}", source.headers.referer));
-        mpv_args.push("--no-terminal".to_string());
+        args.push("--".to_string()); // everything after this is a file/URL, never an option
+        args.push(source.url);
 
         let mut mpv = Command::new(&self.mpv_path)
-            .args(mpv_args)
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("cant spawn mpv");
-        mpv.wait();
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        Self::track(&mut mpv, &sock)
+    }
+    pub fn track(child: &mut Child, sock: &Path) -> std::io::Result<Playback> {
+        // wait for mpv to create the socket
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let stream = loop {
+            match UnixStream::connect(sock) {
+                Ok(s) => break s,
+                Err(e) => {
+                    if child.try_wait()?.is_some() || Instant::now() > deadline {
+                        return Err(e); // mpv died or never opened the socket
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
+        };
+
+        let mut writer = stream.try_clone()?;
+        writeln!(
+            writer,
+            "{}",
+            json!({"command": ["observe_property", 1, "time-pos"]})
+        )?;
+        writeln!(
+            writer,
+            "{}",
+            json!({"command": ["observe_property", 2, "duration"]})
+        )?;
+
+        let mut pb = Playback::default();
+        for line in BufReader::new(stream).lines() {
+            let Ok(line) = line else { break };
+            let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+
+            match v["event"].as_str() {
+                Some("property-change") => match v["name"].as_str() {
+                    Some("time-pos") => {
+                        if let Some(t) = v["data"].as_f64() {
+                            pb.position = t;
+                        } // null before load
+                    }
+                    Some("duration") => {
+                        if !v["data"].is_null() {
+                            pb.duration = v["data"].as_f64()
+                        }
+                    }
+                    _ => {}
+                },
+                Some("end-file") => {
+                    if v["reason"].as_str() == Some("eof") {
+                        pb.reached_end = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(pb) // loop ends when mpv closes the socket, i.e. when it exits
     }
 
     pub fn cleanup(&mut self) {
@@ -221,4 +288,11 @@ fn write_server(output_dir: impl AsRef<str>) {
     archive
         .unpack(output_dir.as_ref().to_string())
         .expect("failed to write to output direcotry");
+}
+
+#[derive(Default, Debug)]
+pub struct Playback {
+    pub position: f64,         // seconds
+    pub duration: Option<f64>, // seconds
+    pub reached_end: bool,     // mpv hit end-of-file naturally
 }
