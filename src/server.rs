@@ -6,7 +6,7 @@ use std::{
     os::unix::{fs::PermissionsExt, net::UnixStream},
     path::{Path, PathBuf},
     process::{Child, ChildStderr, ChildStdin, Command, Stdio, exit},
-    thread,
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 use uuid::Uuid;
@@ -182,12 +182,48 @@ impl Server {
         serde_json::from_str(&response).expect("cant convert response")
     }
 
+    pub fn prefetch(&mut self, id: u64, episode: u64) -> JoinHandle<Option<SourceResult>> {
+        let req_id = self._id;
+        let socket_res = self.socket_handle.try_clone();
+        thread::spawn(move || {
+            let request_struct = Request {
+                id: req_id,
+                r#type: "source",
+                query: None,
+                anime_id: Some(id),
+                episode: Some(episode),
+            };
+            let mut socket;
+            if socket_res.is_err() {
+                None
+            } else {
+                socket = socket_res.unwrap();
+                let request_json =
+                    serde_json::to_string(&request_struct).expect("cant create source json");
+                writeln!(socket, "{}", request_json)
+                    .expect("cant write to socket for source request");
+                let response = {
+                    let mut read_handle =
+                        BufReader::new(socket.try_clone().expect("cant clone socket handle"));
+                    let mut line = String::new();
+                    read_handle
+                        .read_line(&mut line)
+                        .expect("failed to read response");
+                    line
+                };
+                serde_json::from_str(&response).expect("cant convert response")
+            }
+        })
+    }
+
     pub fn play_episode(&mut self, source: Source) -> std::io::Result<Playback> {
         let sock = self.output_dir.join("mpv.sock"); // your per-run temp dir
 
         let mut args = vec![
             format!("--input-ipc-server={}", sock.display()),
             "--no-terminal".to_string(),
+            "--demuxer-max-bytes=500MiB".to_string(),
+            "--cache-on-disk=yes".to_string(),
             format!("--referrer={}", source.headers.referer),
         ];
         if let Some(sub) = &source.sub {
@@ -204,6 +240,7 @@ impl Server {
             .spawn()?;
         Self::track(&mut mpv, &sock)
     }
+
     pub fn track(child: &mut Child, sock: &Path) -> std::io::Result<Playback> {
         // wait for mpv to create the socket
         let deadline = Instant::now() + Duration::from_secs(10);

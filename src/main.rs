@@ -4,6 +4,8 @@ use std::{
     env,
     io::{self, Write},
     process::exit,
+    thread::JoinHandle,
+    time::Instant,
 };
 
 use discord_rpc_client::{Client, Event};
@@ -27,7 +29,7 @@ enum State {
     Playing {
         chosen_id: u64,
         chosen: AnilistEntry,
-        cached_resp: Option<SourceResult>,
+        cached_resp: Option<JoinHandle<Option<SourceResult>>>,
         index: usize,
     },
     Exit,
@@ -71,7 +73,7 @@ fn main() {
                         }
                     } else {
                         let total_episodes = total_ep.unwrap();
-                        ep_behind = (total_episodes - prog - 1) as i64;
+                        ep_behind = (total_episodes - prog) as i64;
                     }
                     if ep_behind > 0 {
                         println!(
@@ -129,6 +131,7 @@ fn main() {
                                     for (index, item) in result.iter().enumerate() {
                                         println!("{}. {}", index + 1, item.title);
                                     }
+                                    println!("\nEnter anime number (0 - exit)");
                                     let mut input = read_input();
                                     while input as usize > result.len() {
                                         input = read_input();
@@ -217,15 +220,22 @@ fn main() {
                 cached_resp,
                 index,
             } => {
-                let source_res;
-                if cached_resp.is_none() {
-                    source_res = server.get_source(chosen_id, chosen.progress + 1);
-                } else {
-                    source_res = cached_resp.unwrap()
-                }
+                let source_res = cached_resp
+                    .and_then(|h| h.join().ok().flatten()) // returns instantly if the thread is done
+                    .filter(|s| s.ok)
+                    .unwrap_or_else(|| server.get_source(chosen_id, chosen.progress + 1));
                 let source = source_res.result;
                 println!("\n-> Playing episode {}", chosen.progress + 1);
-                let mpv_handle = server.play_episode(source);
+                let _ = clear_rpc(&mut drpc);
+                let _ = write_drpc(
+                    &mut drpc,
+                    format!(
+                        "Watching {} -- Episode {}",
+                        chosen.media.title.english,
+                        chosen.progress + 1
+                    ),
+                );
+                // println!("")
                 let total_ep = chosen.media.episodes.clone();
                 let media = chosen.media.clone();
                 let mut total_episodes = 0;
@@ -237,45 +247,55 @@ fn main() {
                 } else {
                     total_episodes = total_ep.unwrap();
                 }
+                let mut cache_response = None;
                 if chosen.progress + 2 < total_episodes {
-                    let cache_resp = server.get_source(chosen_id, chosen.progress + 2);
-                    if !mpv_handle.is_err() {
-                        let mpv_status = mpv_handle.unwrap();
-                        if !mpv_status.duration.is_none() {
-                            let dur = mpv_status.duration.clone().unwrap();
-                            if (mpv_status.position / dur) >= 0.90 || mpv_status.reached_end {
-                                let episode = chosen.progress + 1;
-                                match anilist.update_progress(&chosen, episode) {
-                                    Ok(Update::Completed) => {
-                                        data.remove(index);
-                                    } // no longer CURRENT
-                                    Ok(Update::Progress) => {
-                                        data[index].progress = episode;
-                                        chosen.progress += 1;
-                                        println!("-> Progress updated to {episode}");
+                    cache_response = Some(server.prefetch(chosen_id, chosen.progress + 2));
+                }
+                let mpv_handle = server.play_episode(source);
+                if !mpv_handle.is_err() {
+                    let mpv_status = mpv_handle.unwrap();
+                    if !mpv_status.duration.is_none() {
+                        let dur = mpv_status.duration.clone().unwrap();
+                        if (mpv_status.position / dur) >= 0.90 || mpv_status.reached_end {
+                            let episode = chosen.progress + 1;
+                            match anilist.update_progress(&chosen, episode) {
+                                Ok(Update::Completed) => {
+                                    data.remove(index);
+                                    State::Choose
+                                } // no longer CURRENT
+                                Ok(Update::Progress) => {
+                                    data[index].progress = episode;
+                                    chosen.progress += 1;
+                                    println!("-> Progress updated to {episode}");
+                                    match cache_response {
+                                        Some(h) => State::Playing {
+                                            chosen_id,
+                                            chosen,
+                                            cached_resp: Some(h),
+                                            index,
+                                        },
+                                        None => State::Choose, // caught up, nothing newer to play
                                     }
-                                    Ok(Update::Unchanged) => {}
-                                    Err(e) => eprintln!("couldn't update AniList: {e}"),
                                 }
-                                State::Playing {
-                                    chosen_id,
-                                    chosen,
-                                    cached_resp: Some(cache_resp),
-                                    index,
+                                Ok(Update::Unchanged) => State::Choose,
+                                Err(e) => {
+                                    eprintln!("couldn't update AniList: {e}");
+                                    let _ = clear_rpc(&mut drpc);
+                                    State::Choose
                                 }
-                            } else {
-                                println!("\n-> Skipping the update\n");
-                                State::Choose
                             }
                         } else {
+                            let _ = clear_rpc(&mut drpc);
                             println!("\n-> Skipping the update\n");
                             State::Choose
                         }
                     } else {
+                        let _ = clear_rpc(&mut drpc);
                         println!("\n-> Skipping the update\n");
                         State::Choose
                     }
                 } else {
+                    let _ = clear_rpc(&mut drpc);
                     println!("\n-> Skipping the update\n");
                     State::Choose
                 }
@@ -296,6 +316,11 @@ fn create_drpc() -> Client {
     drpc.on_event(Event::Error, |handle| println!("{handle:?}"));
     drpc.start();
     drpc
+}
+
+fn clear_rpc(drpc: &mut Client) -> Result<(), discord_rpc_client::Error> {
+    drpc.clear_activity()?;
+    Ok(())
 }
 
 fn read_input() -> u64 {
