@@ -8,7 +8,7 @@ use std::{
     process::exit,
 };
 
-use crate::{Num, Str};
+use crate::anilist::Id::{Num, Str};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
