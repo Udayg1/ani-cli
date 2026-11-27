@@ -46,6 +46,7 @@ pub struct Headers {
 pub struct Source {
     url: String,
     sub: Option<String>,
+    audio: Option<String>,
     headers: Headers,
     source: Option<String>,
 }
@@ -228,6 +229,9 @@ impl Server {
         ];
         if let Some(sub) = &source.sub {
             args.push(format!("--sub-file={sub}"));
+        }
+        if let Some(audio) = &source.audio {
+            args.push(format!("--audio-file={audio}"));
         }
         args.push("--".to_string()); // everything after this is a file/URL, never an option
         args.push(source.url);

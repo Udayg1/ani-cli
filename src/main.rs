@@ -71,7 +71,7 @@ fn main() {
                     server.cleanup();
                     exit(0);
                 }
-
+                println!();
                 for (i, entry) in data.iter().enumerate() {
                     let prog = entry.progress;
                     let media = entry.media.clone();
@@ -107,7 +107,7 @@ fn main() {
 
                 let mut input = read_input();
 
-                while input as usize >= data.len() {
+                while input as usize >= data.len() + 1 {
                     input = read_input();
                 }
 
@@ -263,93 +263,108 @@ fn main() {
                 cached_resp,
                 index,
             } => {
-                let source_res = cached_resp
-                    .and_then(|h| h.join().ok().flatten())
-                    .filter(|s| s.ok)
-                    .unwrap_or_else(|| server.get_source(chosen_id, chosen.progress + 1));
-
-                let source = source_res.result;
-
-                println!("\n-> Playing episode {}", chosen.progress + 1);
-                let _ = rpc_tx.send(RpcMessage::Clear);
-                let _ = rpc_tx.send(RpcMessage::Set(format!(
-                    "Watching {} -- Episode {}",
-                    chosen.media.title.english,
-                    chosen.progress + 1
-                )));
-
-                let total_ep = chosen.media.episodes.clone();
-                let media = chosen.media.clone();
-
-                let mut total_episodes = 0;
-
-                if total_ep.is_none() {
-                    let next_air = media.next_airing_episode;
-
-                    if !next_air.is_none() {
-                        total_episodes = next_air.unwrap().episode;
-                    }
+                let ep = chosen.media.clone().episodes.unwrap_or_else(|| {
+                    chosen.media.clone().next_airing_episode.unwrap().episode - 1
+                });
+                if ep <= chosen.progress {
+                    println!("-> No new episodes available");
+                    State::Choose
                 } else {
-                    total_episodes = total_ep.unwrap();
-                }
+                    let source_res = cached_resp
+                        .and_then(|h| h.join().ok().flatten())
+                        .filter(|s| s.ok)
+                        .unwrap_or_else(|| server.get_source(chosen_id, chosen.progress + 1));
 
-                let mut cache_response = None;
+                    let source = source_res.result;
 
-                if chosen.progress + 2 < total_episodes {
-                    cache_response = Some(server.prefetch(chosen_id, chosen.progress + 2));
-                }
+                    println!("\n-> Playing episode {}", chosen.progress + 1);
+                    let _ = rpc_tx.send(RpcMessage::Clear);
+                    let _ = rpc_tx.send(RpcMessage::Set(format!(
+                        "Watching {} -- Episode {}",
+                        chosen.media.title.english,
+                        chosen.progress + 1
+                    )));
 
-                let mpv_handle = server.play_episode(source);
+                    let total_ep = chosen.media.episodes.clone();
+                    let media = chosen.media.clone();
 
-                if !mpv_handle.is_err() {
-                    let mpv_status = mpv_handle.unwrap();
+                    let mut total_episodes = 0;
 
-                    if !mpv_status.duration.is_none() {
-                        let dur = mpv_status.duration.clone().unwrap();
+                    if total_ep.is_none() {
+                        let next_air = media.next_airing_episode;
 
-                        if (mpv_status.position / dur) >= 0.90 || mpv_status.reached_end {
-                            let episode = chosen.progress + 1;
+                        if !next_air.is_none() {
+                            total_episodes = next_air.unwrap().episode;
+                        }
+                    } else {
+                        total_episodes = total_ep.unwrap();
+                    }
 
-                            match anilist.update_progress(&chosen, episode) {
-                                Ok(Update::Completed) => {
-                                    data.remove(index);
-                                    let _ = rpc_tx.send(RpcMessage::Clear);
-                                    State::Choose
-                                }
+                    let mut cache_response = None;
 
-                                Ok(Update::Progress) => {
-                                    data[index].progress = episode;
-                                    chosen.progress += 1;
+                    if chosen.progress + 2 < total_episodes {
+                        cache_response = Some(server.prefetch(chosen_id, chosen.progress + 2));
+                    }
 
-                                    println!("-> Progress updated to {episode}");
+                    let mpv_handle = server.play_episode(source);
 
-                                    match cache_response {
-                                        Some(h) => State::Playing {
-                                            chosen_id,
-                                            chosen,
-                                            cached_resp: Some(h),
-                                            index,
-                                        },
+                    if !mpv_handle.is_err() {
+                        let mpv_status = mpv_handle.unwrap();
 
-                                        None => {
-                                            let _ = rpc_tx.send(RpcMessage::Clear);
-                                            State::Choose
+                        if !mpv_status.duration.is_none() {
+                            let dur = mpv_status.duration.clone().unwrap();
+
+                            if (mpv_status.position / dur) >= 0.90 || mpv_status.reached_end {
+                                let episode = chosen.progress + 1;
+
+                                match anilist.update_progress(&chosen, episode) {
+                                    Ok(Update::Completed) => {
+                                        data.remove(index);
+                                        let _ = rpc_tx.send(RpcMessage::Clear);
+                                        State::Choose
+                                    }
+
+                                    Ok(Update::Progress) => {
+                                        data[index].progress = episode;
+                                        chosen.progress += 1;
+
+                                        println!("-> Progress updated to {episode}");
+
+                                        match cache_response {
+                                            Some(h) => State::Playing {
+                                                chosen_id,
+                                                chosen,
+                                                cached_resp: Some(h),
+                                                index,
+                                            },
+
+                                            None => {
+                                                let _ = rpc_tx.send(RpcMessage::Clear);
+                                                println!("\n-> No new episode available");
+                                                State::Choose
+                                            }
                                         }
                                     }
+
+                                    Ok(Update::Unchanged) => {
+                                        let _ = rpc_tx.send(RpcMessage::Clear);
+                                        State::Choose
+                                    }
+
+                                    Err(e) => {
+                                        eprintln!("couldn't update AniList: {e}");
+
+                                        let _ = rpc_tx.send(RpcMessage::Clear);
+
+                                        State::Choose
+                                    }
                                 }
+                            } else {
+                                let _ = rpc_tx.send(RpcMessage::Clear);
 
-                                Ok(Update::Unchanged) => {
-                                    let _ = rpc_tx.send(RpcMessage::Clear);
-                                    State::Choose
-                                }
+                                println!("\n-> Skipping the update");
 
-                                Err(e) => {
-                                    eprintln!("couldn't update AniList: {e}");
-
-                                    let _ = rpc_tx.send(RpcMessage::Clear);
-
-                                    State::Choose
-                                }
+                                State::Choose
                             }
                         } else {
                             let _ = rpc_tx.send(RpcMessage::Clear);
@@ -365,12 +380,6 @@ fn main() {
 
                         State::Choose
                     }
-                } else {
-                    let _ = rpc_tx.send(RpcMessage::Clear);
-
-                    println!("\n-> Skipping the update\n");
-
-                    State::Choose
                 }
             }
 
@@ -396,8 +405,7 @@ fn create_rpc() -> Sender<RpcMessage> {
                                 connected = true;
                             }
 
-                            Err(e) => {
-                                eprintln!("Discord RPC connection failed: {e:?}");
+                            Err(_) => {
                                 continue;
                             }
                         }
@@ -405,9 +413,7 @@ fn create_rpc() -> Sender<RpcMessage> {
 
                     let act = activity::Activity::new().state(message);
 
-                    if let Err(e) = client.set_activity(act) {
-                        eprintln!("Discord RPC update failed: {e:?}");
-
+                    if let Err(_) = client.set_activity(act) {
                         connected = false;
                     }
                 }
@@ -417,9 +423,7 @@ fn create_rpc() -> Sender<RpcMessage> {
                         continue;
                     }
 
-                    if let Err(e) = client.clear_activity() {
-                        eprintln!("Discord RPC clear failed: {e:?}");
-
+                    if let Err(_) = client.clear_activity() {
                         connected = false;
                     }
                 }
@@ -428,7 +432,6 @@ fn create_rpc() -> Sender<RpcMessage> {
                     if connected {
                         let _ = client.close();
                     }
-
                     break;
                 }
             }

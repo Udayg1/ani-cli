@@ -21,6 +21,8 @@ Resolve a playable source URL:
     -> {"id": 2, "type": "source", "anime_id": 12345, "episode": 3}
     <- {"id": 2, "ok": true, "result": {
             "url": "https://.../index.m3u8",   # best-bandwidth variant
+            "audio": "https://.../audio.m3u8" | null,  # separate audio track, if the
+                                               # stream has one (pass to mpv --audio-file)
             "sub": "https://.../en.vtt" | null,
             "headers": {"Referer": "https://anichan.to/"},
             "source": "anichan" | "fallback:<provider>"}}
@@ -57,9 +59,7 @@ BASE_URL = "https://anichan.to/"
 KEYS_CHUNK_ID = "7621"
 FALLBACK_SOURCE = "https://anikuro.to/api/v1/sources/"
 FALLBACK_PROVIDERS = ("allanime", "animepahe", "anikoto")
-USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64; rv:156.0) Gecko/20100101 Firefox/156.0"
-)
+USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:156.0) Gecko/20100101 Firefox/156.0"
 TIMEOUT = 15
 MAX_LINE = 1 << 20  # max bytes in a single request line
 
@@ -175,6 +175,20 @@ def decrypt(payload: dict, session_n: str, const_c: str, const_k: str):
 
 
 # --------------------------------------------------------------------------
+# HLS playlist helpers
+# --------------------------------------------------------------------------
+
+_ATTR_RE = re.compile(r'([A-Z0-9-]+)=("[^"]*"|[^,]*)')
+
+
+def parse_attrs(line: str) -> dict:
+    """Parse the attribute list of an HLS tag: `#EXT-X-MEDIA:TYPE=AUDIO,URI="a.m3u8"`.
+    Quoted values may contain commas, so a plain split(",") is not enough."""
+    _, _, rest = line.partition(":")
+    return {k: v.strip().strip('"') for k, v in _ATTR_RE.findall(rest)}
+
+
+# --------------------------------------------------------------------------
 # Source client
 # --------------------------------------------------------------------------
 
@@ -220,7 +234,12 @@ class SourceClient:
             try:
                 self.ensure_session(force=attempt > 0)
                 return fn()
-            except (requests.RequestException, ValueError, KeyError, SourceError) as exc:
+            except (
+                requests.RequestException,
+                ValueError,
+                KeyError,
+                SourceError,
+            ) as exc:
                 last = exc
                 log(f"attempt {attempt + 1} failed: {exc!r}")
         raise SourceError(f"source request failed: {last}")
@@ -262,33 +281,65 @@ class SourceClient:
             raise SourceError("could not decrypt server list")
         return data["servers"]
 
-    def pick_best_variant(self, url: str) -> str:
+    def pick_best_variant(self, url: str) -> dict:
         """
-        If `url` is an HLS master playlist, return the absolute URL of its
-        highest-bandwidth variant. Anything else is returned unchanged.
+        If `url` is an HLS master playlist, return {"url": <highest-bandwidth variant>,
+        "audio": <its separate audio playlist or None>}, both absolute.
+        Anything else is returned unchanged with audio None.
+
+        Many streams split audio into its own playlist (#EXT-X-MEDIA:TYPE=AUDIO).
+        Once we hand a player the bare variant URL, that audio is lost unless we
+        pass it along separately.
         """
+        plain = {"url": url, "audio": None}
         with self.http.get(url, stream=True, timeout=TIMEOUT) as r:
             r.raise_for_status()
             head = next(r.iter_content(1 << 20), b"")  # never download a whole video
         text = head.decode("utf-8", "replace")
         if not text.lstrip().startswith("#EXTM3U"):
-            return url
+            return plain
 
         lines = text.splitlines()
-        variants = []
+        variants = []  # (bandwidth, uri, audio group id)
+        audio_groups = {}  # group id -> [attrs of renditions that have their own URI]
         for i, line in enumerate(lines):
-            if not line.startswith("#EXT-X-STREAM-INF"):
-                continue
-            m = re.search(r"(?<![-\w])BANDWIDTH=(\d+)", line)
-            uri = next(
-                (l.strip() for l in lines[i + 1 :] if l.strip() and not l.startswith("#")),
-                None,
-            )
-            if m and uri:
-                variants.append((int(m.group(1)), uri))
+            if line.startswith("#EXT-X-STREAM-INF"):
+                attrs = parse_attrs(line)
+                uri = next(
+                    (
+                        l.strip()
+                        for l in lines[i + 1 :]
+                        if l.strip() and not l.startswith("#")
+                    ),
+                    None,
+                )
+                try:
+                    bandwidth = int(attrs.get("BANDWIDTH", ""))
+                except ValueError:
+                    continue
+                if uri:
+                    variants.append((bandwidth, uri, attrs.get("AUDIO")))
+            elif line.startswith("#EXT-X-MEDIA"):
+                attrs = parse_attrs(line)
+                # a rendition without URI is muxed into the variant: nothing separate to return
+                if attrs.get("TYPE") == "AUDIO" and attrs.get("URI"):
+                    audio_groups.setdefault(attrs.get("GROUP-ID"), []).append(attrs)
         if not variants:
-            return url
-        return urljoin(url, max(variants)[1])
+            return plain
+
+        _, uri, group = max(variants, key=lambda v: v[0])
+        audio = None
+        renditions = audio_groups.get(group) or []
+        if renditions:
+            pick = next(
+                (a for a in renditions if a.get("DEFAULT") == "YES"),
+                next(
+                    (a for a in renditions if a.get("AUTOSELECT") == "YES"),
+                    renditions[0],
+                ),
+            )
+            audio = urljoin(url, pick["URI"])
+        return {"url": urljoin(url, uri), "audio": audio}
 
     def _anichan_source(self, anime_id, episode: int):
         servers = self._with_session_retry(
@@ -314,12 +365,19 @@ class SourceClient:
 
         for c in candidates:
             try:
-                url = self.pick_best_variant(c["stream"])
+                best = self.pick_best_variant(c["stream"])
             except requests.RequestException as exc:
                 log(f"variant selection failed for {c['stream']}: {exc!r}")
                 continue
+            url = best["url"]
             headers = {} if "mp4upload" in url else {"Referer": BASE_URL}
-            return {"url": url, "sub": c["sub"], "headers": headers, "source": "anichan"}
+            return {
+                "url": url,
+                "audio": best["audio"],
+                "sub": c["sub"],
+                "headers": headers,
+                "source": "anichan",
+            }
         return None
 
     def _fallback_source(self, anime_id, episode: int):
@@ -341,6 +399,7 @@ class SourceClient:
                         continue
                 return {
                     "url": url,
+                    "audio": None,
                     "sub": None,
                     "headers": headers,
                     "source": f"fallback:{provider}",
@@ -388,7 +447,11 @@ def dispatch(raw: bytes) -> dict:
             result = SRC.search(query)
         elif kind == "source":
             anime_id = req.get("anime_id")
-            if isinstance(anime_id, bool) or not isinstance(anime_id, (int, str)) or not str(anime_id).strip():
+            if (
+                isinstance(anime_id, bool)
+                or not isinstance(anime_id, (int, str))
+                or not str(anime_id).strip()
+            ):
                 raise SourceError("'anime_id' must be an int or string")
             try:
                 episode = int(req.get("episode"))
@@ -479,9 +542,7 @@ def main():
     threading.Thread(target=watch_stdin, daemon=True).start()
 
     # warm up the session in the background so the first request is faster
-    threading.Thread(
-        target=lambda: _try(SRC.ensure_session), daemon=True
-    ).start()
+    threading.Thread(target=lambda: _try(SRC.ensure_session), daemon=True).start()
 
     print(
         json.dumps({"event": "ready", "protocol": PROTOCOL_VERSION, "socket": path}),
